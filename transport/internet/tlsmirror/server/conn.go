@@ -3,8 +3,11 @@ package server
 import (
 	"bytes"
 	"context"
+	"crypto/cipher"
 	"net"
 	"time"
+
+	"golang.org/x/crypto/chacha20"
 
 	"github.com/v2fly/v2ray-core/v5/transport/internet"
 	"github.com/v2fly/v2ray-core/v5/transport/internet/tlsmirror"
@@ -36,6 +39,18 @@ type connState struct {
 	firstWriteDelay time.Duration
 
 	transportLayerPadding *TransportLayerPadding
+
+	connectionEnrollmentEnabled           bool
+	connectionEnrollmentProcessorEnrolled bool
+	connectionEnrollmentProcessor         tlsmirror.ConnectionEnrollmentConfirmationProcessor
+	connectionEnrollmentRemover           tlsmirror.RemoveConnectionFunc
+
+	sequenceWatermarkEnabled                 bool
+	sequenceWatermarkTx, sequenceWatermarkRx cipher.Stream
+}
+
+func (s *connState) VerifyConnectionEnrollment(req *tlsmirror.EnrollmentConfirmationReq) (*tlsmirror.EnrollmentConfirmationResp, error) {
+	return &tlsmirror.EnrollmentConfirmationResp{Enrolled: true}, nil
 }
 
 func (s *connState) Read(b []byte) (n int, err error) {
@@ -113,10 +128,48 @@ func (s *connState) SetWriteDeadline(t time.Time) error {
 
 func (s *connState) Close() error {
 	s.done()
+	if s.connectionEnrollmentRemover != nil {
+		if err := s.connectionEnrollmentRemover(); err != nil {
+			newError("failed to remove connection enrollment").Base(err).AtWarning().WriteToLog()
+		}
+		s.connectionEnrollmentRemover = nil
+	}
 	return nil
 }
 
+func (s *connState) onS2CMessage(message *tlsmirror.TLSRecord) (drop bool, ok error) {
+	if message.RecordType == mirrorcommon.TLSRecord_RecordType_handshake {
+		if s.connectionEnrollmentEnabled && !s.connectionEnrollmentProcessorEnrolled {
+			clientRandom, serverRandom, err := s.mirrorConn.GetHandshakeRandom()
+			if err != nil {
+				newError("failed to get handshake random").Base(err).AtWarning().WriteToLog()
+				return false, nil
+			}
+
+			remove, err := s.connectionEnrollmentProcessor.AddConnection(s.ctx, clientRandom, serverRandom, s)
+			if err != nil {
+				newError("failed to add connection for enrollment").Base(err).AtWarning().WriteToLog()
+				return false, nil
+			}
+			s.connectionEnrollmentRemover = remove
+			s.connectionEnrollmentProcessorEnrolled = true
+			return false, nil
+		}
+	}
+	return false, nil
+}
+
 func (s *connState) onC2SMessage(message *tlsmirror.TLSRecord) (drop bool, ok error) {
+	if s.sequenceWatermarkEnabled {
+		if s.sequenceWatermarkRx != nil {
+			if (message.RecordType == mirrorcommon.TLSRecord_RecordType_application_data ||
+				message.RecordType == mirrorcommon.TLSRecord_RecordType_alert) && len(message.Fragment) >= 16 {
+				watermarkRegion := message.Fragment[len(message.Fragment)-16:]
+				s.sequenceWatermarkRx.XORKeyStream(watermarkRegion, watermarkRegion)
+			}
+		}
+	}
+
 	if message.RecordType == mirrorcommon.TLSRecord_RecordType_application_data {
 		if s.decryptor == nil {
 			clientRandom, serverRandom, err := s.mirrorConn.GetHandshakeRandom()
@@ -156,6 +209,24 @@ func (s *connState) onC2SMessage(message *tlsmirror.TLSRecord) (drop bool, ok er
 			return false, nil
 		}
 
+		if s.sequenceWatermarkEnabled && s.sequenceWatermarkRx == nil {
+			clientRandom, serverRandom, err := s.mirrorConn.GetHandshakeRandom()
+			if err != nil {
+				newError("failed to get handshake random").Base(err).AtError().WriteToLog()
+				return true, nil
+			}
+			key, nonce, err := mirrorcrypto.DeriveSequenceWatermarkingKey(s.primaryKey, clientRandom, serverRandom, ":c2s")
+			if err != nil {
+				newError("failed to derive sequence watermarking key").Base(err).AtError().WriteToLog()
+				return true, nil
+			}
+			s.sequenceWatermarkRx, err = chacha20.NewUnauthenticatedCipher(key, nonce)
+			if err != nil {
+				newError("failed to create sequence watermarking cipher").Base(err).AtError().WriteToLog()
+				return true, nil
+			}
+		}
+
 		if !s.activated {
 			s.handler(s)
 			s.activated = true
@@ -182,6 +253,41 @@ func (s *connState) WriteMessage(message []byte) error {
 		LegacyProtocolVersion: s.protocolVersion,
 		RecordLength:          uint16(len(buffer)),
 		Fragment:              buffer,
+		InsertedMessage:       true,
 	}
 	return s.mirrorConn.InsertS2CMessage(&record)
+}
+
+func (s *connState) onC2SMessageTx(message *tlsmirror.TLSRecord) (drop bool, ok error) {
+	return false, nil
+}
+
+func (s *connState) onS2CMessageTx(message *tlsmirror.TLSRecord) (drop bool, ok error) {
+	if s.sequenceWatermarkEnabled {
+		if s.sequenceWatermarkTx != nil {
+			if (message.RecordType == mirrorcommon.TLSRecord_RecordType_application_data ||
+				message.RecordType == mirrorcommon.TLSRecord_RecordType_alert) && len(message.Fragment) >= 16 {
+				watermarkRegion := message.Fragment[len(message.Fragment)-16:]
+				s.sequenceWatermarkTx.XORKeyStream(watermarkRegion, watermarkRegion)
+			}
+		}
+		if message.InsertedMessage && s.sequenceWatermarkTx == nil {
+			clientRandom, serverRandom, err := s.mirrorConn.GetHandshakeRandom()
+			if err != nil {
+				newError("failed to get handshake random").Base(err).AtError().WriteToLog()
+				return true, nil
+			}
+			key, nonce, err := mirrorcrypto.DeriveSequenceWatermarkingKey(s.primaryKey, clientRandom, serverRandom, ":s2c")
+			if err != nil {
+				newError("failed to derive sequence watermarking key").Base(err).AtError().WriteToLog()
+				return true, nil
+			}
+			s.sequenceWatermarkTx, err = chacha20.NewUnauthenticatedCipher(key, nonce)
+			if err != nil {
+				newError("failed to create sequence watermarking cipher").Base(err).AtError().WriteToLog()
+				return true, nil
+			}
+		}
+	}
+	return false, nil
 }

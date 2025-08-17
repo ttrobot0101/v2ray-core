@@ -18,6 +18,7 @@ import (
 	"github.com/v2fly/v2ray-core/v5/transport/internet"
 	"github.com/v2fly/v2ray-core/v5/transport/internet/tlsmirror"
 	"github.com/v2fly/v2ray-core/v5/transport/internet/tlsmirror/mirrorbase"
+	"github.com/v2fly/v2ray-core/v5/transport/internet/tlsmirror/mirrorenrollment"
 	"github.com/v2fly/v2ray-core/v5/transport/internet/tlsmirror/tlstrafficgen"
 )
 
@@ -55,6 +56,8 @@ type persistentMirrorTLSDialer struct {
 	obm outbound.Manager
 
 	explicitNonceCiphersuiteLookup *ciphersuiteLookuper
+
+	enrollmentConfirmationClient *mirrorenrollment.EnrollmentConfirmationClient
 }
 
 func (d *persistentMirrorTLSDialer) init(ctx context.Context, config *Config) error {
@@ -97,10 +100,7 @@ func (d *persistentMirrorTLSDialer) init(ctx context.Context, config *Config) er
 			newError("failed to remove existing handler").WriteToLog()
 		}
 
-		err = d.obm.AddHandler(context.Background(), &Outbound{
-			tag:      d.config.CarrierConnectionTag,
-			listener: d.listener,
-		})
+		err = d.obm.AddHandler(context.Background(), d.outbound)
 		if err != nil {
 			newError("failed to add outbound handler").Base(err).AtWarning().WriteToLog()
 			return
@@ -141,6 +141,18 @@ func (d *persistentMirrorTLSDialer) init(ctx context.Context, config *Config) er
 			return nil
 		}
 	}
+
+	if d.config.ConnectionEnrolment != nil {
+		enrollmentServerIdentifier, err := mirrorenrollment.DeriveEnrollmentServerIdentifier(d.config.PrimaryKey)
+		if err != nil {
+			return newError("failed to derive enrollment server identifier").Base(err).AtError()
+		}
+		d.enrollmentConfirmationClient, err = mirrorenrollment.NewEnrollmentConfirmationClient(d.ctx, d.config.ConnectionEnrolment, enrollmentServerIdentifier)
+		if err != nil {
+			return newError("failed to create enrollment confirmation client").Base(err).AtError()
+		}
+	}
+
 	return nil
 }
 
@@ -171,28 +183,50 @@ func (d *persistentMirrorTLSDialer) handleIncomingCarrierConnection(ctx context.
 
 	ctx, cancel := context.WithCancel(ctx)
 	cconnState := &clientConnState{
-		ctx:                   ctx,
-		done:                  cancel,
-		localAddr:             conn.LocalAddr(),
-		remoteAddr:            conn.RemoteAddr(),
-		handler:               d.handleIncomingReadyConnection,
-		primaryKey:            d.config.PrimaryKey,
-		readPipe:              make(chan []byte, 1),
-		firstWrite:            true,
-		firstWriteDelay:       firstWriteDelay,
-		transportLayerPadding: d.config.TransportLayerPadding,
+		ctx:                      ctx,
+		done:                     cancel,
+		localAddr:                conn.LocalAddr(),
+		remoteAddr:               conn.RemoteAddr(),
+		handler:                  d.handleIncomingReadyConnection,
+		primaryKey:               d.config.PrimaryKey,
+		readPipe:                 make(chan []byte, 1),
+		firstWrite:               true,
+		firstWriteDelay:          firstWriteDelay,
+		transportLayerPadding:    d.config.TransportLayerPadding,
+		sequenceWatermarkEnabled: d.config.SequenceWatermarkingEnabled,
 	}
 
 	cconnState.mirrorConn = mirrorbase.NewMirroredTLSConn(ctx, conn, forwardConn, cconnState.onC2SMessage, cconnState.onS2CMessage, conn,
-		d.explicitNonceCiphersuiteLookup.Lookup)
+		d.explicitNonceCiphersuiteLookup.Lookup, cconnState.onC2SMessageTx, cconnState.onS2CMessageTx)
 }
 
 type connectionContextGetter interface {
 	GetConnectionContext() context.Context
 }
 
+type verifyConnectionEnrollment interface {
+	VerifyConnectionEnrollmentWithProcessor(connectionEnrollmentConfirmationClient tlsmirror.ConnectionEnrollmentConfirmation) error
+}
+
 func (d *persistentMirrorTLSDialer) handleIncomingReadyConnection(conn internet.Connection) {
 	go func() {
+		if d.config.ConnectionEnrolment != nil {
+			if enrollableConn, ok := conn.(verifyConnectionEnrollment); ok {
+				if d.enrollmentConfirmationClient != nil {
+					err := enrollableConn.VerifyConnectionEnrollmentWithProcessor(d.enrollmentConfirmationClient)
+					if err != nil {
+						newError("failed to verify connection enrollment").Base(err).AtWarning().WriteToLog()
+						return
+					}
+				} else {
+					newError("enrollment confirmation client is not set, connection rejected").AtWarning().WriteToLog()
+					return
+				}
+			} else {
+				newError("connection does not implement verifyConnectionEnrollment, connection rejected").AtWarning().WriteToLog()
+				return
+			}
+		}
 		var waitedForReady bool
 		if getter, ok := conn.(connectionContextGetter); ok {
 			ctx := getter.GetConnectionContext()

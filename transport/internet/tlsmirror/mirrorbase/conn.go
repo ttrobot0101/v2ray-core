@@ -15,7 +15,11 @@ import (
 
 // NewMirroredTLSConn creates a new mirrored TLS connection.
 // No stable interface
-func NewMirroredTLSConn(ctx context.Context, clientConn net.Conn, serverConn net.Conn, onC2SMessage, onS2CMessage tlsmirror.MessageHook, closable common.Closable, explicitNonceDetection tlsmirror.ExplicitNonceDetection) tlsmirror.InsertableTLSConn {
+func NewMirroredTLSConn(ctx context.Context, clientConn net.Conn,
+	serverConn net.Conn, onC2SMessage, onS2CMessage tlsmirror.MessageHook,
+	closable common.Closable, explicitNonceDetection tlsmirror.ExplicitNonceDetection,
+	onC2SMessageTx, onS2CMessageTx tlsmirror.MessageHook,
+) tlsmirror.InsertableTLSConn {
 	explicitNonceDetectionReady, explicitNonceDetectionOver := context.WithCancel(ctx)
 	c := &conn{
 		ctx:                         ctx,
@@ -28,6 +32,8 @@ func NewMirroredTLSConn(ctx context.Context, clientConn net.Conn, serverConn net
 		explicitNonceDetection:      explicitNonceDetection,
 		explicitNonceDetectionReady: explicitNonceDetectionReady,
 		explicitNonceDetectionOver:  explicitNonceDetectionOver,
+		OnC2SMessageTx:              onC2SMessageTx,
+		OnS2CMessageTx:              onS2CMessageTx,
 	}
 	c.ctx, c.done = context.WithCancel(ctx)
 	go c.c2sWorker()
@@ -53,6 +59,9 @@ type conn struct {
 	OnC2SMessage           tlsmirror.MessageHook
 	OnS2CMessage           tlsmirror.MessageHook
 	explicitNonceDetection tlsmirror.ExplicitNonceDetection
+
+	OnC2SMessageTx tlsmirror.MessageHook
+	OnS2CMessageTx tlsmirror.MessageHook
 
 	c2sInsert chan *tlsmirror.TLSRecord
 	s2cInsert chan *tlsmirror.TLSRecord
@@ -182,6 +191,17 @@ func (c *conn) c2sWorker() {
 					}
 				}
 			}
+			if c.OnC2SMessageTx != nil {
+				drop, err := c.OnC2SMessageTx(record)
+				if err != nil {
+					c.done()
+					newError("failed to process C2S message").Base(err).AtWarning().WriteToLog()
+					return
+				}
+				if drop {
+					continue
+				}
+			}
 			err := recordWriter.WriteRecord(record, false)
 			if err != nil {
 				c.done()
@@ -275,6 +295,7 @@ func (c *conn) s2cWorker() {
 	if err != nil {
 		c.done()
 		newError("failed to unpack server hello").Base(err).AtWarning().WriteToLog()
+		drainCopy(c.clientConn, nil, c.serverConn)
 		return
 	}
 	c.ServerRandom = serverHello.ServerRandom
@@ -285,6 +306,14 @@ func (c *conn) s2cWorker() {
 	// implicit memory consistency synchronization release write for c.tls12ExplicitNonce
 	c.explicitNonceDetectionOver()
 
+	_, err = c.OnS2CMessage(&s2cHandshake)
+	if err != nil {
+		newError("failed to process S2C server hello message").Base(err).AtWarning().WriteToLog()
+		drainCopy(c.clientConn, nil, c.serverConn)
+		c.done()
+		return
+	}
+
 	serverSocketReader := &readerWithInitialData{initialData: s2cReminderData, innerReader: c.serverConn}
 	serverSocket := bufio.NewReaderSize(serverSocketReader, 65536)
 	recordReader := mirrorcommon.NewTLSRecordStreamReader(serverSocket)
@@ -293,8 +322,9 @@ func (c *conn) s2cWorker() {
 	if len(s2cReminderData) == 0 {
 		err := clientConnectionWriter.Flush()
 		if err != nil {
-			c.done()
 			newError("failed to flush client connection writer").Base(err).AtWarning().WriteToLog()
+			drainCopy(c.clientConn, nil, c.serverConn)
+			c.done()
 			return
 		}
 	}
@@ -315,6 +345,17 @@ func (c *conn) s2cWorker() {
 						nonce := c.s2cExplicitNonceCounterGenerator()
 						copy(record.Fragment, nonce)
 					}
+				}
+			}
+			if c.OnS2CMessageTx != nil {
+				drop, err := c.OnS2CMessageTx(record)
+				if err != nil {
+					c.done()
+					newError("failed to process S2C message").Base(err).AtWarning().WriteToLog()
+					return
+				}
+				if drop {
+					continue
 				}
 			}
 			err := recordWriter.WriteRecord(record, false)
